@@ -5,14 +5,8 @@ set -euo pipefail
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 
-# 用户自定义 nginx 配置文件的根目录（每个子目录名需与二级域名前缀一致）
-readonly USER_CONF_DIR="/volume2/web_packages/nginx"
-
 # WebStation 自动生成的 nginx conf.d 目录
 readonly CONF_D_DIR="/usr/local/etc/nginx/conf.d"
-
-# WebStation 的 web 根目录
-readonly WEB_ROOT="/volume2/web"
 
 # ─── 函数 ────────────────────────────────────────────────────────────────────
 
@@ -20,15 +14,27 @@ log()  { echo "[INFO]  $*"; }
 warn() { echo "[WARN]  $*" >&2; }
 die()  { echo "[ERROR] $*" >&2; exit 1; }
 
+# 自动查找 web_packages 所在的 volume，返回其路径（如 /volume1）
+find_web_packages_volume() {
+    local vol
+    for vol in /volume*/; do
+        if [[ -d "${vol}web_packages" ]]; then
+            echo "${vol%/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # 解析所有 .service* 文件，建立"域名 → include 目录名"映射
 # 输出格式：每行 "<domain> <dirname>"
 scan_service_files() {
-    local file domain include_path dirname
+    local file domain include_path dirname web_root="$1"
 
     shopt -s nullglob
     for file in "${CONF_D_DIR}"/.service*; do
         # 从 root 指令中提取 web 根目录下的子目录名（即域名标识）
-        mapfile -t domains < <(grep -Po "root\s+\"${WEB_ROOT}/\K[^\"]+" "$file" 2>/dev/null)
+        mapfile -t domains < <(grep -Po "root\s+\"${web_root}/\K[^\"]+" "$file" 2>/dev/null)
 
         # 从 include 指令中提取对应的目录路径（去掉末尾的 /user.conf*）
         mapfile -t include_paths < <(grep -Po 'include\s+\K[^"]+/([^/]+)(?=/user\.conf\*)' "$file" 2>/dev/null)
@@ -51,11 +57,12 @@ scan_service_files() {
 link_domain() {
     local domain="$1"
     local target_dir="$2"       # conf.d 下的目标目录名
+    local user_conf_dir="$3"
     local target_path="${CONF_D_DIR}/${target_dir}"
 
     # 在用户配置根目录下查找与域名同名的文件夹
     local config_folder
-    config_folder="$(find "$USER_CONF_DIR" -maxdepth 2 -type d -name "$domain" -print -quit)"
+    config_folder="$(find "$user_conf_dir" -maxdepth 2 -type d -name "$domain" -print -quit)"
 
     if [[ -z "$config_folder" ]]; then
         warn "未找到域名 '$domain' 对应的用户配置目录，跳过。"
@@ -79,13 +86,23 @@ reload_nginx() {
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
 
 main() {
+    # 自动探测 web_packages 所在的 volume
+    local volume
+    if ! volume="$(find_web_packages_volume)"; then
+        die "未在任何 /volume* 下找到 web_packages 目录，请确认 WebStation 已正确安装。"
+    fi
+    log "检测到 web_packages 位于：${volume}/web_packages"
+
+    local USER_CONF_DIR="${volume}/web_packages/nginx"
+    local WEB_ROOT="${volume}/web"
+
     log "开始扫描 ${CONF_D_DIR} 中的服务配置文件..."
 
     # 收集所有域名映射
     declare -A domain_map
     while read -r domain dirname; do
         domain_map["$domain"]="$dirname"
-    done < <(scan_service_files)
+    done < <(scan_service_files "$WEB_ROOT")
 
     if [[ ${#domain_map[@]} -eq 0 ]]; then
         warn "未找到任何可处理的域名，退出。"
@@ -101,7 +118,7 @@ main() {
     sleep 5
 
     for domain in "${!domain_map[@]}"; do
-        link_domain "$domain" "${domain_map[$domain]}"
+        link_domain "$domain" "${domain_map[$domain]}" "$USER_CONF_DIR"
     done
 
     reload_nginx

@@ -9,12 +9,12 @@ WebStation 每次重启或更新都会重新生成 nginx 的 `conf.d` 目录，�
 ## 目录结构
 
 ```
-/volume2/
+/volume*/                       # 脚本自动检测 web_packages 所在的 volume
 ├── web/                        # WebStation Web 根目录
 │   └── <subdomain>/            # 每个二级域名对应一个子目录
 │
 ├── web_packages/
-│   └── nginx/                  # 用户自定义配置根目录（USER_CONF_DIR）
+│   └── nginx/                  # 用户自定义配置根目录
 │       └── <subdomain>/        # 目录名须与对应的二级域名前缀完全一致
 │           └── user.conf       # 自定义 nginx 配置片段
 │
@@ -34,14 +34,18 @@ WebStation 每次重启或更新都会重新生成 nginx 的 `conf.d` 目录，�
 以二级域名 `app` 为例（对应 `app.example.com`）：
 
 ```bash
+# 自动找到 web_packages 所在的 volume
+VOLUME=$(find /volume*/ -maxdepth 1 -name web_packages -type d 2>/dev/null | head -1 | grep -Po '/volume\d+')
+echo "web_packages 位于：$VOLUME"
+
 # 创建 web 根目录（如果还没有）
-mkdir -p /volume2/web/app
+mkdir -p "${VOLUME}/web/app"
 
 # 创建用户配置目录
-mkdir -p /volume2/web_packages/nginx/app
+mkdir -p "${VOLUME}/web_packages/nginx/app"
 
 # 创建并编辑 user.conf
-cat > /volume2/web_packages/nginx/app/user.conf << 'EOF'
+cat > "${VOLUME}/web_packages/nginx/app/user.conf" << 'EOF'
 # 在此写入自定义 nginx 配置，例如：
 location /api/ {
     proxy_pass http://127.0.0.1:3000/;
@@ -60,14 +64,11 @@ curl -O https://raw.githubusercontent.com/synologyer/nginx-link/main/nginx-link.
 chmod +x nginx-link.sh
 ```
 
-### 3. 修改脚本顶部的路径配置（按需）
+### 3. 运行脚本（按需修改 conf.d 路径）
 
-```bash
-# 打开脚本，修改以下三个常量
-readonly USER_CONF_DIR="/volume2/web_packages/nginx"  # 用户配置根目录
-readonly CONF_D_DIR="/usr/local/etc/nginx/conf.d"     # WebStation conf.d 目录
-readonly WEB_ROOT="/volume2/web"                       # web 根目录
-```
+脚本会自动扫描 `/volume*/web_packages` 确定当前 NAS 使用哪个 volume，无需手动配置。
+
+如果你的 WebStation conf.d 路径不是默认的 `/usr/local/etc/nginx/conf.d`，打开脚本修改顶部的 `CONF_D_DIR` 常量即可。
 
 ### 4. 运行脚本
 
