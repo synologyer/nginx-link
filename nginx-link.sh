@@ -1,84 +1,111 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# nginx-link.sh — 为群晖 WebStation 的 nginx 虚拟主机自动创建用户配置符号链接
 
-# 外部conf文件目录
-directory_user_conf="/volume2/web_packages/nginx/"
+set -euo pipefail
 
-# web station conf文件目录
-directory_conf_d="/usr/local/etc/nginx/conf.d"
+# ─── 配置 ────────────────────────────────────────────────────────────────────
 
-# web station文件夹
-directory_web="/volume2/web/"
+# 用户自定义 nginx 配置文件的根目录（每个子目录名需与二级域名前缀一致）
+readonly USER_CONF_DIR="/volume2/web_packages/nginx"
 
-# 存储提取到的域名列表及其对应的 include 文件路径
-declare -A domain_include_map
+# WebStation 自动生成的 nginx conf.d 目录
+readonly CONF_D_DIR="/usr/local/etc/nginx/conf.d"
 
-echo "开始扫描符合条件的文件..."
+# WebStation 的 web 根目录
+readonly WEB_ROOT="/volume2/web"
 
-for file in $directory_conf_d/.service*; do
-    # 提取域名
-    domains=($(grep -Po "root\s+\"$directory_web\K[^\"]+" "$file"))
-    # 提取文件夹路径，并将结果存储在 include_files 数组中
-    include_files=($(grep -Po 'include\s+\K[^"]+/([^/]+)(?=\/user\.conf\*)' "$file"))
+# ─── 函数 ────────────────────────────────────────────────────────────────────
 
-    # 如果没有找到域名，则跳过该文件
-    if [ ${#domains[@]} -eq 0 ] || [ ${#domains[@]} -ne ${#include_files[@]} ]; then
-        continue
-    fi
+log()  { echo "[INFO]  $*"; }
+warn() { echo "[WARN]  $*" >&2; }
+die()  { echo "[ERROR] $*" >&2; exit 1; }
 
-    # 将域名及其对应的 include 文件路径添加到映射中
-    for ((i=0; i<${#domains[@]}; i++)); do
-        domain=${domains[$i]}
-        include_file=${include_files[$i]}
-        # 使用basename命令获取文件名并存储
-        filename=$(basename "$include_file")
-        domain_include_map["$domain"]="$filename"
+# 解析所有 .service* 文件，建立"域名 → include 目录名"映射
+# 输出格式：每行 "<domain> <dirname>"
+scan_service_files() {
+    local file domain include_path dirname
+
+    shopt -s nullglob
+    for file in "${CONF_D_DIR}"/.service*; do
+        # 从 root 指令中提取 web 根目录下的子目录名（即域名标识）
+        mapfile -t domains < <(grep -Po "root\s+\"${WEB_ROOT}/\K[^\"]+" "$file" 2>/dev/null)
+
+        # 从 include 指令中提取对应的目录路径（去掉末尾的 /user.conf*）
+        mapfile -t include_paths < <(grep -Po 'include\s+\K[^"]+/([^/]+)(?=/user\.conf\*)' "$file" 2>/dev/null)
+
+        # 域名数量与 include 路径数量必须一致，否则跳过
+        if [[ ${#domains[@]} -eq 0 ]] || [[ ${#domains[@]} -ne ${#include_paths[@]} ]]; then
+            continue
+        fi
+
+        for ((i = 0; i < ${#domains[@]}; i++)); do
+            domain="${domains[$i]}"
+            dirname="$(basename "${include_paths[$i]}")"
+            echo "$domain $dirname"
+        done
     done
-done
+    shopt -u nullglob
+}
 
-echo "扫描完成."
+# 为单个域名创建符号链接
+link_domain() {
+    local domain="$1"
+    local target_dir="$2"       # conf.d 下的目标目录名
+    local target_path="${CONF_D_DIR}/${target_dir}"
 
-# 列出所有域名和对应的 include 文件路径
-echo "找到以下域名及其对应的文件夹路径名："
-for domain in "${!domain_include_map[@]}"; do
-    echo "$domain (${domain_include_map[$domain]})"
-done
+    # 在用户配置根目录下查找与域名同名的文件夹
+    local config_folder
+    config_folder="$(find "$USER_CONF_DIR" -maxdepth 2 -type d -name "$domain" -print -quit)"
 
-# 等待 30 秒
-echo "等待 5 秒..."
-sleep 5
-
-# 遍历所有域名并创建符号链接
-for domain in "${!domain_include_map[@]}"; do
-    # 查找匹配的配置文件夹
-    config_folder=$(find "$directory_user_conf" -type d -name "$domain")
-
-    if [ -z "$config_folder" ]; then
-        echo "未找到匹配的配置文件夹: $domain"
-        continue
+    if [[ -z "$config_folder" ]]; then
+        warn "未找到域名 '$domain' 对应的用户配置目录，跳过。"
+        return 0
     fi
 
-    # 获取目标文件路径
-    target_file="${directory_conf_d}/${domain_include_map[$domain]}"
-    echo "为域名 $domain 创建符号链接，目标文件路径是: $target_file"
+    ln -sf "$config_folder" "$target_path"
+    log "符号链接已创建：$target_path -> $config_folder"
+}
 
-    # 创建符号链接
-    ln -sf "$config_folder" "$target_file"
-
-    if [ $? -eq 0 ]; then
-        echo "已创建 $target_file 链接到 $config_folder"
+# 重新加载 nginx
+reload_nginx() {
+    log "正在重新加载 nginx 配置..."
+    if sudo nginx -s reload; then
+        log "nginx 配置重新加载成功。"
     else
-        echo "创建符号链接失败: $target_file -> $config_folder"
+        die "nginx 配置重新加载失败，请检查配置语法。"
     fi
-done
+}
 
-# 重新加载 nginx 配置
-echo "重新加载 NGINX 配置..."
-sudo nginx -s reload
+# ─── 主流程 ──────────────────────────────────────────────────────────────────
 
-if [ $? -eq 0 ]; then
-    echo "NGINX 配置重新加载成功！"
-else
-    echo "NGINX 配置重新加载失败！"
-fi
+main() {
+    log "开始扫描 ${CONF_D_DIR} 中的服务配置文件..."
 
-echo "配置完成"
+    # 收集所有域名映射
+    declare -A domain_map
+    while read -r domain dirname; do
+        domain_map["$domain"]="$dirname"
+    done < <(scan_service_files)
+
+    if [[ ${#domain_map[@]} -eq 0 ]]; then
+        warn "未找到任何可处理的域名，退出。"
+        exit 0
+    fi
+
+    log "扫描完成，共找到 ${#domain_map[@]} 个域名："
+    for domain in "${!domain_map[@]}"; do
+        log "  $domain  (-> ${domain_map[$domain]})"
+    done
+
+    log "5 秒后开始创建符号链接..."
+    sleep 5
+
+    for domain in "${!domain_map[@]}"; do
+        link_domain "$domain" "${domain_map[$domain]}"
+    done
+
+    reload_nginx
+    log "全部配置完成。"
+}
+
+main "$@"
